@@ -18,6 +18,7 @@ from transformers import BertTokenizer
 
 default_label_file_path = "/user_home/du.jing/国家安全/单标签/data/labels.json"
 default_test_data_path = "./data/test_0709_top11_labels.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 TRUE_LABEL_FIELD = "labels"
 PRED_LABEL_FIELD = "model_pred"
@@ -327,6 +328,8 @@ def get_model_name(model_path: str) -> str:
     if path.exists():
         if path.is_file():
             return path.parent.name or path.stem
+        if path.name == "model" and path.parent.name == "output_models":
+            return path.parent.parent.name
         return path.name
 
     parts = [part for part in normalized_path.replace("\\", "/").split("/") if part]
@@ -335,6 +338,8 @@ def get_model_name(model_path: str) -> str:
 
     name = parts[-1]
     parent_name = parts[-2] if len(parts) > 1 else ""
+    if name == "model" and parent_name == "output_models" and len(parts) > 2:
+        return parts[-3]
     model_file_suffixes = {".pt", ".pth", ".bin", ".safetensors", ".ckpt", ".onnx", ".pb", ".h5"}
     if Path(name).suffix.lower() in model_file_suffixes:
         return parent_name or Path(name).stem
@@ -525,23 +530,33 @@ def get_args():
     parser.add_argument("--eval-data", type=str, default=default_test_data_path, help="Test dataset path")
     parser.add_argument("--result-suffix", type=str, default="", help="Prediction cache suffix")
     parser.add_argument("--label-path", type=str, default=default_label_file_path, help="Label to index mapping file path")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(SCRIPT_DIR),
+        help="测试输出根目录；默认是 test_multi.py 所在目录",
+    )
     parser.add_argument("--save-result-csv", type=str_to_bool, default=False, help="Whether to save CSV files")
     return parser.parse_args()
 
 
 def main():
     opts = get_args()
-    eval_data_path = opts.eval_data
+    eval_data_path = str(Path(opts.eval_data).expanduser().resolve())
+    model_path = str(Path(opts.model_path).expanduser().resolve())
+    label_path = str(Path(opts.label_path).expanduser().resolve())
+    output_root = Path(opts.output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    load_model(model_file_path=opts.model_path, label_file_path=opts.label_path)
+    load_model(model_file_path=model_path, label_file_path=label_path)
     run_warmup()
 
     if not opts.result_suffix:
         predict_save_path = f"{Path(eval_data_path).stem}_preded_multi_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
     else:
         predict_save_path = f"{Path(eval_data_path).stem}_preded_multi_{opts.result_suffix}.json"
-    output_dir = f"./test_0709/{Path(predict_save_path).stem}"
-    predict_save_path = output_dir+"/"+predict_save_path
+    output_dir = output_root / Path(predict_save_path).stem
+    predict_save_path = output_dir / predict_save_path
 
     suffix_prefix = f"{opts.result_suffix}_" if opts.result_suffix else ""
 
@@ -549,12 +564,12 @@ def main():
     per_class_csv = f"{suffix_prefix}per_class_metrics.csv"
     overall_txt = f"{suffix_prefix}overall_metrics.txt"
     overall_csv = f"{suffix_prefix}overall_metrics.csv"
-    overall_compare_xlsx_path = os.path.join("./test_0709", OVERALL_COMPARE_XLSX)
+    overall_compare_xlsx_path = output_root / OVERALL_COMPARE_XLSX
 
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("========== 获取测试集预测结果 ==========")
-    if os.path.exists(predict_save_path):
+    if predict_save_path.exists():
         valid_data = read_json_or_jsonl(predict_save_path)
         print(f"已从缓存读取测试样本数: {len(valid_data)}")
     else:
@@ -603,21 +618,21 @@ def main():
     print("\n========== 每个类别统计结果 ==========")
     print(df.to_string(index=False))
 
-    xlsx_path = os.path.join(output_dir, per_class_xlsx)
+    xlsx_path = output_dir / per_class_xlsx
     df.to_excel(xlsx_path, index=False, engine="openpyxl")
 
     if opts.save_result_csv:
-        csv_path = os.path.join(output_dir, per_class_csv)
+        csv_path = output_dir / per_class_csv
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
-    overall_txt_path = os.path.join(output_dir, overall_txt)
+    overall_txt_path = output_dir / overall_txt
     save_overall_metrics_txt(
         output_path=overall_txt_path,
         rows=overall_rows,
     )
 
     if opts.save_result_csv:
-        overall_csv_path = os.path.join(output_dir, overall_csv)
+        overall_csv_path = output_dir / overall_csv
         save_overall_metrics_csv(
             output_path=overall_csv_path,
             rows=overall_rows,
@@ -625,7 +640,7 @@ def main():
 
     append_overall_metrics_xlsx(
         output_path=overall_compare_xlsx_path,
-        model_path=opts.model_path,
+        model_path=model_path,
         rows=overall_rows,
     )
 
