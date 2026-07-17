@@ -32,6 +32,7 @@ from classifier_model import BertForMultiLabel
 default_label_file_path = '/user_home/du.jing/国家安全/单标签/data/labels.json'
 default_model_file_path = '/user_home/du.jing/国家安全/单标签/model/20260612_165846/best_checkpoint'
 default_val_data_path = '/user_home/du.jing/国家安全/单标签/data/val_0616.jsonl'
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 def load_model( model_file_path, label_file_path):
     global tokenizer
@@ -232,6 +233,17 @@ def read_json_or_jsonl(file_path: str) -> List[Dict[str, Any]]:
             data.append(item)
 
     return data
+
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
 
 
 # =========================
@@ -456,8 +468,14 @@ def get_args():
     parser.add_argument("--eval-data", type=str, default=default_val_data_path, help="Valuation dataset path")
     parser.add_argument("--result-suffix", type=str, default="", help="Valuation dataset path")
     parser.add_argument("--label-path", type=str, default=default_label_file_path, help="Label to index mapping file path")
-    parser.add_argument("--save-result-csv", type=bool, default=False, help="")
-    parser.add_argument("--plot-confusion-matrix", type=bool, default=False, help="")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(SCRIPT_DIR),
+        help="测试输出根目录；默认是 test.py 所在目录",
+    )
+    parser.add_argument("--save-result-csv", type=str_to_bool, default=False, help="")
+    parser.add_argument("--plot-confusion-matrix", type=str_to_bool, default=False, help="")
     
     args = parser.parse_args()
     return args
@@ -466,9 +484,11 @@ def get_args():
 
 def main():
     opts = get_args()
-    eval_data_path = opts.eval_data
-    model_path = opts.model_path
-    label_path = opts.label_path
+    eval_data_path = str(Path(opts.eval_data).expanduser().resolve())
+    model_path = str(Path(opts.model_path).expanduser().resolve())
+    label_path = str(Path(opts.label_path).expanduser().resolve())
+    output_root = Path(opts.output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
     save_result_csv = opts.save_result_csv
     plot_confusion_matrix = opts.plot_confusion_matrix
     
@@ -480,7 +500,8 @@ def main():
         predict_save_path = f"{Path(eval_data_path).stem}_preded_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
     else:
         predict_save_path = f"{Path(eval_data_path).stem}_preded_{opts.result_suffix}.json"
-    OUTPUT_DIR = f"./eval_result_{Path(predict_save_path).stem}"
+    output_dir = output_root / f"eval_result_{Path(predict_save_path).stem}"
+    predict_save_path = output_dir / predict_save_path
 
     # 输出文件名
     PER_CLASS_XLSX = "per_class_metrics.xlsx"
@@ -490,10 +511,10 @@ def main():
     CONFUSION_MAT = "confusion_matrix.png"
     CONFUSION_CSV = "confusion_matrix.csv"
     
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("========== 获取验证集预测结果 ==========")
-    if os.path.exists(predict_save_path):
+    if predict_save_path.exists():
         valid_data = read_json_or_jsonl(predict_save_path)
         print(f"已从缓存读取验证样本数: {len(valid_data)}")
     else:
@@ -617,16 +638,16 @@ def main():
     print(df.to_string(index=False))
 
     # 保存每类指标 Excel
-    xlsx_path = os.path.join(OUTPUT_DIR, PER_CLASS_XLSX)
+    xlsx_path = output_dir / PER_CLASS_XLSX
     df.to_excel(xlsx_path, index=False, engine="openpyxl")
     
     # 保存每类指标 CSV
     if save_result_csv:
-        csv_path = os.path.join(OUTPUT_DIR, PER_CLASS_CSV)
+        csv_path = output_dir / PER_CLASS_CSV
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     # 保存整体指标 TXT
-    overall_txt_path = os.path.join(OUTPUT_DIR, OVERALL_TXT)
+    overall_txt_path = output_dir / OVERALL_TXT
     save_overall_metrics_txt(
         output_path=overall_txt_path,
         accuracy=accuracy,
@@ -643,7 +664,7 @@ def main():
 
     # 保存整体指标 CSV
     if save_result_csv:
-        overall_csv_path = os.path.join(OUTPUT_DIR, OVERALL_CSV)
+        overall_csv_path = output_dir / OVERALL_CSV
         save_overall_metrics_csv(
             output_path=overall_csv_path,
             accuracy=accuracy,
@@ -662,13 +683,15 @@ def main():
     # 混淆矩阵也只用验证集中真实出现过的标签
     cm = confusion_matrix(y_true, y_pred, labels=eval_labels)
     cm_df = pd.DataFrame(cm, index=eval_labels, columns=eval_labels)
+    confusion_image_path = output_dir / CONFUSION_MAT
     if plot_confusion_matrix:
-        save_confusion_matrix(cm, eval_labels, CONFUSION_MAT, )
+        save_confusion_matrix(cm, eval_labels, confusion_image_path)
 
-    confusion_path = os.path.join(OUTPUT_DIR, CONFUSION_CSV)
+    confusion_path = output_dir / CONFUSION_CSV
     cm_df.to_csv(confusion_path, encoding="utf-8-sig")
 
     print("\n========== 保存完成 ==========")
+    print(f"预测缓存 JSON   : {predict_save_path}")
     print(f"每个类别指标 Excel: {xlsx_path}")
     if save_result_csv:
         print(f"每个类别指标 CSV : {csv_path}")
@@ -676,6 +699,8 @@ def main():
     if save_result_csv:
         print(f"整体指标 CSV     : {overall_csv_path}")
     print(f"混淆矩阵 CSV     : {confusion_path}")
+    if plot_confusion_matrix:
+        print(f"混淆矩阵图片    : {confusion_image_path}")
 
 
 if __name__ == "__main__":
