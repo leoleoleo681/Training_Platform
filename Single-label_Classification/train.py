@@ -694,12 +694,7 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--num_train_epochs",default=20.0,type=float,help="Total number of training epochs to perform.")
     parser.add_argument("--max_steps",default=-1,type=int,help="If > 0: set total number of training steps to perform. Override num_train_epochs.",)
-    parser.add_argument(
-        "--warmup_steps",
-        default=0.05,
-        type=float,
-        help="Warmup占总优化步数的比例，范围[0, 1)。",
-    )
+    parser.add_argument("--warmup_steps",default=0.05,type=float,help="Warmup占总优化步数的比例，范围[0, 1)。",)
 
     parser.add_argument("--verbose_logging",action="store_true",help="If true, all of the warnings related to data processing will be printed. ",)
     parser.add_argument("--lang_id",default=0,type=int,help="language id of input for language-specific xlm models (see tokenization_xlm.PRETRAINED_INIT_CONFIGURATION)",)
@@ -707,7 +702,7 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=500, help="Log every X updates steps.")
     parser.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every X updates steps. Set <= 0 to disable step-based saving.")
     parser.add_argument("--save_each_epoch", action="store_true", help="Save checkpoint at the end of each epoch.")
-    parser.add_argument("--no_cuda", action="store_true", help="Whether not to use CUDA when available")
+    parser.add_argument("--choose_device",type=str,choices=["cpu", "gpu"],default="gpu",help="选择运行设备：cpu 或 gpu，默认 gpu",)
     parser.add_argument("--overwrite_output_dir", action="store_true", default=True, help="Overwrite the content of the output directory")
     parser.add_argument("--overwrite_cache", action="store_true", help="Rebuild the cached training and evaluation sets")
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
@@ -782,9 +777,9 @@ def main():
 
     # Setup CUDA, GPU & distributed training
     device = None
-    if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
+    if args.local_rank == -1 or args.choose_device=="cpu":
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.choose_device=="cpu" else "cpu")
+        args.n_gpu = 0 if args.choose_device=="cpu" else torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
