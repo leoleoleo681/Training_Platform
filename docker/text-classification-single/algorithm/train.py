@@ -153,7 +153,7 @@ def apply_json_config(parser, args):
         if evaluate_file
         else None
     )
-    args.dataset_cache_dir = str(model_root / "runtime" / "cache")
+    args.dataset_cache_dir = str(task_root / "datasets" / "cache")
     args.status_file = str(model_root / "status.json")
     args.result_file = str(model_root / "runtime" / "train_result.json")
     args.platform_model_root = str(model_root)
@@ -879,7 +879,7 @@ def load_and_cache_dataset(
     )
 
     if os.path.exists(cached_file) and not args.overwrite_cache:
-        logger.info("Loading Dataset from cached file %s", cached_file)
+        logger.info("Loading Dataset from shared cached file %s", cached_file)
         dataset = CustomDatasetForBERT.load(cached_file)
     else:
         logger.info("Creating Dataset from file -- %s", data_file)
@@ -892,7 +892,7 @@ def load_and_cache_dataset(
             loss_type=args.loss_type,
         )
         if args.local_rank in [-1, 0]:
-            logger.info("Saving Dataset into cached file %s", cached_file)
+            logger.info("Saving Dataset into shared cached file %s", cached_file)
             dataset.save(cached_file)
 
     if args.local_rank == 0:

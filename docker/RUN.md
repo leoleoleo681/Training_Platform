@@ -40,7 +40,8 @@
 ├── datasets/
 │   ├── training/{train_file}.jsonl
 │   ├── test/{test_file}.jsonl
-│   └── labels/{label_file}.json
+│   ├── labels/{label_file}.json
+│   └── cache/                               # 运行时自动创建的共享特征缓存
 ├── models/{model_name}/
 │   └── run_train.json
 └── evaluation/{model_name}/tests/{test_id}/
@@ -118,7 +119,7 @@
 | `seed` | `42` | 随机种子 |
 | `loss_type` | `Focal` | `CE`或`Focal` |
 | `dataloader_num_workers` | `12` | DataLoader worker数量 |
-| `overwrite_cache` | `false` | 是否重新生成数据缓存 |
+| `overwrite_cache` | `false` | 是否忽略已有共享缓存并重新生成 |
 | `fp16` | `false` | 当前镜像未安装Apex，必须保持`false` |
 
 其他损失函数参数以示例配置和入口代码为准。`label_distribution`当前只能是`auto`。
@@ -229,10 +230,11 @@ models/{model_name}/
 ├── checkpoints/
 ├── best_checkpoint/
 ├── runtime/
-│   ├── cache/
 │   └── train_result.json
 └── training_summary.json
 ```
+
+预处理特征缓存在任务级目录`datasets/cache/`。不同模型训练任务使用相同的数据文件名、`model_type`、`max_length`和`loss_type`时会直接复用缓存；这些参数变化时会生成新的缓存。若同名数据文件的内容发生变化，可设置`overwrite_cache: true`强制重新处理。
 
 评估目录中的标准产物：
 
