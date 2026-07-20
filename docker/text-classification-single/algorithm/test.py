@@ -6,6 +6,7 @@ import torch
 import json
 import onnx
 import time
+import traceback
 
 from argparse import ArgumentParser
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ default_label_file_path = '/user_home/du.jing/国家安全/单标签/data/labels
 default_model_file_path = '/user_home/du.jing/国家安全/单标签/model/20260612_165846/best_checkpoint'
 default_val_data_path = '/user_home/du.jing/国家安全/单标签/data/val_0616.jsonl'
 SCRIPT_DIR = Path(__file__).resolve().parent
+_ACTIVE_STATUS_PATH = None
 
 def load_model(model_file_path, label_file_path, choose_device="gpu"):
     global tokenizer
@@ -537,8 +539,118 @@ def save_platform_artifacts(
     atomic_save_json(predictions_path, predictions)
 
 
+def resolve_task_file(task_root, directory, filename, field):
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise ValueError(f"{field}必须是文件名，不能包含路径")
+    path = (task_root / "datasets" / directory / filename).resolve(strict=True)
+    try:
+        path.relative_to(task_root)
+    except ValueError as exc:
+        raise ValueError(f"{field}越出任务目录") from exc
+    if not path.is_file():
+        raise ValueError(f"{field}不是普通文件")
+    return str(path)
+
+
+def write_platform_status(path, state, error=None):
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {}
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    payload.update({
+        "schema_version": 1,
+        "operation": "validate",
+        "status": state,
+        "updated_at": now,
+        "error": error,
+    })
+    payload.setdefault("started_at", now)
+    payload.setdefault("finished_at", None)
+    payload.setdefault("progress", {
+        "current_step": 0,
+        "total_steps": 1,
+        "percent": 0.0,
+    })
+    if state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        payload["finished_at"] = now
+    if state == "SUCCEEDED":
+        payload["progress"] = {
+            "current_step": 1,
+            "total_steps": 1,
+            "percent": 100.0,
+        }
+    atomic_save_json(path, payload)
+
+
+def apply_json_config(parser, args):
+    """Let test.py own its JSON schema and platform path conventions."""
+    global _ACTIVE_STATUS_PATH
+    if not args.config:
+        return args
+
+    config_path = Path(args.config).resolve(strict=True)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("评估配置根节点必须是JSON对象")
+
+    parser_fields = {action.dest: action for action in parser._actions}
+    for field, value in config.items():
+        action = parser_fields.get(field)
+        if action is None or field == "config":
+            continue
+        try:
+            converted = action.type(value) if action.type and value is not None else value
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"评估参数{field}类型错误") from exc
+        if action.choices is not None and converted not in action.choices:
+            raise ValueError(f"评估参数{field}不支持值{converted}")
+        setattr(args, field, converted)
+
+    task_root = Path(os.environ.get("TRAINING_TASK_ROOT", "/mnt/task")).resolve(strict=True)
+    try:
+        config_path.relative_to(task_root)
+    except ValueError as exc:
+        raise ValueError("评估配置越出任务目录") from exc
+
+    model_name = config.get("model_name")
+    test_id = config.get("test_id")
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("model_name不能为空")
+    if not isinstance(test_id, str) or not test_id:
+        raise ValueError("test_id不能为空")
+
+    model_root = (task_root / "models" / model_name).resolve(strict=True)
+    model_path = model_root / "best_checkpoint"
+    if not (model_path / "config.json").is_file():
+        model_path = model_root / "output_models" / "model"
+    if not (model_path / "config.json").is_file():
+        raise ValueError(f"模型不存在或不完整: {model_root}")
+
+    test_root = config_path.parent
+    args.model_path = str(model_path)
+    args.eval_data = resolve_task_file(task_root, "test", config.get("test_file"), "test_file")
+    args.label_path = resolve_task_file(task_root, "labels", config.get("label_file"), "label_file")
+    args.output_dir = str(model_root)
+    args.result_suffix = test_id
+    args.report_path = str(test_root / "report.json")
+    args.predictions_path = str(test_root / "predictions.json")
+    args.model_id = model_name
+    args.report_id = test_id
+    args.dataset_id = Path(args.eval_data).name
+    args.platform_status_path = test_root / "status.json"
+    _ACTIVE_STATUS_PATH = args.platform_status_path
+    write_platform_status(args.platform_status_path, "STARTING")
+    return args
+
+
 def get_args():
     parser = ArgumentParser(description="Process valset evaluation")
+    parser.add_argument("--config", type=str, default=None, help="平台JSON评估配置")
     parser.add_argument("--model-path", type=str, default=default_model_file_path, help="Model to run evaluation")
     parser.add_argument("--eval-data", type=str, default=default_val_data_path, help="Valuation dataset path")
     parser.add_argument("--result-suffix", type=str, default="", help="Valuation dataset path")
@@ -559,13 +671,15 @@ def get_args():
     parser.add_argument("--report-id", type=str, default=None)
     parser.add_argument("--dataset-id", type=str, default=None)
     
-    args = parser.parse_args()
+    args = apply_json_config(parser, parser.parse_args())
     return args
 
     
 
 def main():
     opts = get_args()
+    if opts.config:
+        write_platform_status(opts.platform_status_path, "RUNNING")
     eval_data_path = str(Path(opts.eval_data).expanduser().resolve())
     model_path = str(Path(opts.model_path).expanduser().resolve())
     label_path = str(Path(opts.label_path).expanduser().resolve())
@@ -802,6 +916,23 @@ def main():
         macro_f1=macro_f1,
     )
 
+    if opts.config:
+        write_platform_status(opts.platform_status_path, "SUCCEEDED")
+
+
+def platform_main():
+    try:
+        return main()
+    except Exception as exc:
+        if _ACTIVE_STATUS_PATH:
+            write_platform_status(
+                _ACTIVE_STATUS_PATH,
+                "FAILED",
+                {"code": "EVALUATION_FAILED", "message": str(exc)},
+            )
+        traceback.print_exc()
+        raise
+
 
 if __name__ == "__main__":
-    main()
+    platform_main()

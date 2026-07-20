@@ -3,11 +3,14 @@ from collections import Counter
 import logging
 import os
 import random
+import shutil
 from time import sleep
 import time
 import timeit
 import json
+import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import sklearn.metrics
@@ -35,6 +38,7 @@ from data_processor import (
 from classifier_model import BertForMultiLabel
 
 logger = logging.getLogger(__name__)
+_ACTIVE_STATUS_FILE = None
 
 MODEL_CLASSES = {
     "bert": (BertConfig, BertForMultiLabel, BertTokenizer),
@@ -59,7 +63,12 @@ def update_platform_status(status_file, progress, force=False, state=None):
         if state:
             payload["status"] = state
         payload["progress"] = progress
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        payload["updated_at"] = now
+        if state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            payload["finished_at"] = now
+        if state == "SUCCEEDED":
+            payload["error"] = None
         temp_file = "{}.tmp.{}".format(status_file, os.getpid())
         with open(temp_file, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -69,6 +78,155 @@ def update_platform_status(status_file, progress, force=False, state=None):
         os.replace(temp_file, status_file)
     except Exception as exc:
         logger.warning("更新平台状态失败: %s", exc)
+
+
+def atomic_save_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name("{}.tmp.{}".format(path.name, os.getpid()))
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(str(temp_path), str(path))
+
+
+def resolve_task_file(task_root, directory, filename, field):
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise ValueError("{}必须是文件名，不能包含路径".format(field))
+    path = (task_root / "datasets" / directory / filename).resolve(strict=True)
+    try:
+        path.relative_to(task_root)
+    except ValueError as exc:
+        raise ValueError("{}越出任务目录".format(field)) from exc
+    if not path.is_file():
+        raise ValueError("{}不是普通文件".format(field))
+    return str(path)
+
+
+def apply_json_config(parser, args):
+    """Let train.py own its JSON schema and platform path conventions."""
+    global _ACTIVE_STATUS_FILE
+    if not args.config:
+        return args
+
+    config_path = Path(args.config).resolve(strict=True)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("训练配置根节点必须是JSON对象")
+
+    parser_fields = {action.dest: action for action in parser._actions}
+    for field, value in config.items():
+        action = parser_fields.get(field)
+        if action is None or field == "config":
+            continue
+        if action.nargs == 0 and isinstance(action.const, bool) and type(value) is not bool:
+            raise ValueError("训练参数{}必须是布尔值".format(field))
+        try:
+            converted = action.type(value) if action.type and value is not None else value
+        except (TypeError, ValueError) as exc:
+            raise ValueError("训练参数{}类型错误".format(field)) from exc
+        if action.choices is not None and converted not in action.choices:
+            raise ValueError("训练参数{}不支持值{}".format(field, converted))
+        setattr(args, field, converted)
+
+    task_root = Path(os.environ.get("TRAINING_TASK_ROOT", "/mnt/task")).resolve(strict=True)
+    try:
+        config_path.relative_to(task_root)
+    except ValueError as exc:
+        raise ValueError("训练配置越出任务目录") from exc
+
+    model_root = config_path.parent
+    algorithm_root = Path(os.environ.get("TRAINING_ALGORITHM_ROOT", Path(__file__).resolve().parent))
+    args.model_name_or_path = os.environ.get(
+        "TRAINING_PRETRAINED_MODEL",
+        str(algorithm_root / "pretrained_model" / "TinyBert"),
+    )
+    args.output_dir = str(model_root / "output_models")
+    args.label_file = resolve_task_file(task_root, "labels", config.get("label_file"), "label_file")
+    args.train_file = resolve_task_file(task_root, "training", config.get("train_file"), "train_file")
+    evaluate_file = config.get("evaluate_file")
+    args.evaluate_file = (
+        resolve_task_file(task_root, "test", evaluate_file, "evaluate_file")
+        if evaluate_file
+        else None
+    )
+    args.dataset_cache_dir = str(model_root / "runtime" / "cache")
+    args.status_file = str(model_root / "status.json")
+    args.result_file = str(model_root / "runtime" / "train_result.json")
+    args.platform_model_root = str(model_root)
+    args.platform_config = config
+    args.platform_started_at = datetime.now(timezone.utc).isoformat()
+    _ACTIVE_STATUS_FILE = args.status_file
+    atomic_save_json(
+        args.status_file,
+        {
+            "schema_version": 1,
+            "operation": "train",
+            "status": "STARTING",
+            "started_at": args.platform_started_at,
+            "updated_at": args.platform_started_at,
+            "finished_at": None,
+            "progress": {
+                "current_epoch": 0,
+                "total_epochs": None,
+                "current_step": 0,
+                "total_steps": None,
+                "percent": 0.0,
+            },
+            "error": None,
+        },
+    )
+    return args
+
+
+def finalize_platform_training(args):
+    if not getattr(args, "config", None) or args.local_rank not in [-1, 0]:
+        return
+    model_root = Path(args.platform_model_root)
+    model_source = Path(args.model_output_dir)
+    if not (model_source / "config.json").is_file():
+        raise RuntimeError("训练完成但模型目录不完整: {}".format(model_source))
+    best_checkpoint = model_root / "best_checkpoint"
+    shutil.copytree(str(model_source), str(best_checkpoint))
+
+    result = {}
+    result_path = Path(args.result_file)
+    if result_path.is_file():
+        with result_path.open("r", encoding="utf-8") as handle:
+            result = json.load(handle)
+    finished_at = datetime.now(timezone.utc).isoformat()
+    config = args.platform_config
+    atomic_save_json(
+        model_root / "training_summary.json",
+        {
+            "schema_version": 1,
+            "status": "SUCCEEDED",
+            "started_at": args.platform_started_at,
+            "finished_at": finished_at,
+            "model_name": config.get("model_name"),
+            "training_mode": config.get("training_mode"),
+            "global_step": result.get("global_step"),
+            "average_loss": result.get("average_loss"),
+            "best_epoch": result.get("best_epoch"),
+            "selection_score": result.get("selection_score"),
+            "best_checkpoint": "best_checkpoint",
+            "legacy_model_dir": "output_models/model",
+            "checkpoint_dir": "checkpoints",
+        },
+    )
+    update_platform_status(
+        args.status_file,
+        {
+            "current_epoch": int(args.num_train_epochs),
+            "total_epochs": int(args.num_train_epochs),
+            "percent": 100.0,
+        },
+        force=True,
+        state="SUCCEEDED",
+    )
 
 
 def set_seed(args):
@@ -744,14 +902,16 @@ def load_and_cache_dataset(
     return dataset
 
 
-def main():
+def run():
     parser = argparse.ArgumentParser()
 
-    # 仅路径参数由启动脚本传入；稳定的训练配置在这里提供默认值。
+    parser.add_argument("--config", type=str, default=None, help="平台JSON训练配置")
+
+    # 命令行默认值与参数约束由训练脚本维护；--config 中的同名字段会覆盖默认值。
     parser.add_argument("--model_type",default="bert",type=str,help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()),)
-    parser.add_argument("--model_name_or_path",default=None,type=str,required=True,help="Path to pre-trained model",)
-    parser.add_argument("--output_dir",default=None,type=str,required=True,help="Root directory for the selected model and TensorBoard output.",)
-    parser.add_argument("--label_file",default=None,type=str,required=True,help="label 2 int map")
+    parser.add_argument("--model_name_or_path",default=None,type=str,help="Path to pre-trained model",)
+    parser.add_argument("--output_dir",default=None,type=str,help="Root directory for the selected model and TensorBoard output.",)
+    parser.add_argument("--label_file",default=None,type=str,help="label 2 int map")
     parser.add_argument("--max_length",default=512,type=int,help="The maximum sequence A and B total length after tokenization, no more than 512.")
     parser.add_argument("--threshold",default=0.5,type=float,help="the threshold of label probability")
 
@@ -829,7 +989,11 @@ def main():
         help="每个epoch保留的非国家安全样本比例，按其原始数量计算，范围(0, 1]。",
     )
 
-    args = parser.parse_args()
+    args = apply_json_config(parser, parser.parse_args())
+
+    for field in ("model_name_or_path", "output_dir", "label_file", "train_file"):
+        if not getattr(args, field):
+            parser.error("--{}不能为空".format(field))
 
     # 稳定模型固定写入output_dir/model；checkpoint单独写入相邻的checkpoints目录。
     args.output_dir = os.path.abspath(args.output_dir)
@@ -1025,7 +1189,24 @@ def main():
 
     logger.info("script finishes")
 
+    finalize_platform_training(args)
+
     return 0
+
+
+def main():
+    try:
+        return run()
+    except Exception as exc:
+        if _ACTIVE_STATUS_FILE:
+            update_platform_status(
+                _ACTIVE_STATUS_FILE,
+                {"percent": 0.0},
+                force=True,
+                state="FAILED",
+            )
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

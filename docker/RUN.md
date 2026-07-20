@@ -88,29 +88,26 @@
 /mnt/task/models/{model_name}/run_train.json
 ```
 
-完整示例见[run_train.json](../examples/text-classification-single-task/models/demo_model/run_train.json)。入口严格拒绝未知字段。
+完整示例见[run_train.json](../examples/text-classification-single-task/models/demo_model/run_train.json)。配置由训练脚本直接读取；与训练脚本参数同名的字段会自动应用，平台元数据字段由训练脚本按需使用。
 
-### 5.1 必填字段
+### 5.1 基础字段
 
-| 字段 | 约束 |
-| --- | --- |
-| `schema_version` | 当前只能是整数`1` |
-| `model_name` | 1至64位，只允许英文字母、数字、`_`和`-`，首位为字母或数字 |
-| `output_dir` | 必须严格等于`/mnt/task/models/{model_name}` |
-| `label_file` | `datasets/labels/`下的`.json`文件名，只允许basename |
-| `train_file` | `datasets/training/`下的`.jsonl`文件名，只允许basename |
-| `choose_device` | `cpu`或`gpu` |
-| `training_mode` | `quick`、`balance`或`quality`，仅记录模式；平台仍需写入明确超参数 |
-| `per_gpu_train_batch_size` | 不小于1的整数 |
-| `per_gpu_eval_batch_size` | 不小于1的整数 |
-| `learning_rate` | 大于0 |
-| `num_train_epochs` | 大于0 |
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| `schema_version` | 推荐 | 配置协议版本，当前示例为整数`1` |
+| `model_name` | 推荐 | 用于训练摘要；模型目录由配置文件所在目录确定 |
+| `label_file` | 是 | `datasets/labels/`下的文件名，只允许basename |
+| `train_file` | 是 | `datasets/training/`下的文件名，只允许basename |
+| `evaluate_file` | 否 | `datasets/test/`下的验证集文件名 |
+| `choose_device` | 否 | `cpu`或`gpu`，默认`gpu` |
+| `training_mode` | 否 | 仅作为训练摘要中的平台元数据 |
+
+`output_dir`、状态文件、结果文件和缓存目录均根据`run_train.json`的位置自动生成，不需要写入配置。
 
 ### 5.2 常用可选字段
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `evaluate_file` | `null` | `datasets/test/`下的验证集文件名 |
 | `max_length` | `512` | Token最大长度，范围1至512 |
 | `gradient_accumulation_steps` | `1` | 梯度累积步数 |
 | `weight_decay` | `0.01` | 权重衰减 |

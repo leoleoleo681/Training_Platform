@@ -94,7 +94,7 @@ docker build \
 1. 继承PyTorch 2.2.2、CUDA 11.8、cuDNN 8开发镜像；
 2. 安装固定版本Python依赖；
 3. 将算法复制到`/opt/training/algorithm/`；
-4. 将入口复制到`/opt/training/entrypoint.py`；
+4. 将通用入口复制到`/opt/training/entrypoint.py`；
 5. 检查TinyBert的配置、词表和至少一种权重文件；
 6. 导入全部运行依赖，并断言关键依赖版本；
 7. 导入现有训练、评估和ONNX模块，提前发现语法或依赖错误；
@@ -102,6 +102,8 @@ docker build \
 9. 将容器入口设置为`python /opt/training/entrypoint.py`。
 
 其中`torch.version.cuda == "11.8"`只验证PyTorch编译使用的CUDA版本，不代表构建机器或运行机器已经有可见GPU。
+
+通用入口不读取JSON配置，也不维护训练参数列表。它只把`train`或`validate`转换为对应算法脚本调用，并传递`--config`。训练与评估脚本自行读取配置，因此增加算法参数时无需同步修改入口。
 
 ## 5. 构建后检查
 
