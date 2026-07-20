@@ -4,10 +4,10 @@ import logging
 import os
 import random
 from time import sleep
+import time
 import timeit
 import json
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+from datetime import datetime, timezone
 
 import numpy as np
 import sklearn.metrics
@@ -40,6 +40,35 @@ MODEL_CLASSES = {
     "bert": (BertConfig, BertForMultiLabel, BertTokenizer),
     # "roberta": (BertConfig, BertForMultiLabel, BertTokenizer)
 }
+
+
+def update_platform_status(status_file, progress, force=False, state=None):
+    """Atomically update optional platform progress without changing legacy logs."""
+    if not status_file:
+        return
+    now_monotonic = time.monotonic()
+    last_update = getattr(update_platform_status, "_last_update", 0.0)
+    if not force and now_monotonic - last_update < 1.0:
+        return
+    update_platform_status._last_update = now_monotonic
+    try:
+        payload = {}
+        if os.path.exists(status_file):
+            with open(status_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        if state:
+            payload["status"] = state
+        payload["progress"] = progress
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        temp_file = "{}.tmp.{}".format(status_file, os.getpid())
+        with open(temp_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_file, status_file)
+    except Exception as exc:
+        logger.warning("更新平台状态失败: %s", exc)
 
 
 def set_seed(args):
@@ -222,15 +251,24 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     # train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     if args.local_rank == -1:
-        train_sampler = DynamicNonSecuritySampler(
-            dataset=train_dataset,
-            non_security_id=args.label2int["非国家安全"],
-            keep_ratio=args.non_security_keep_ratio,
-        )
+        if "非国家安全" in args.label2int:
+            train_sampler = DynamicNonSecuritySampler(
+                dataset=train_dataset,
+                non_security_id=args.label2int["非国家安全"],
+                keep_ratio=args.non_security_keep_ratio,
+            )
+        else:
+            logger.info("标签表中没有‘非国家安全’，使用标准随机采样器。")
+            train_sampler = RandomSampler(train_dataset)
     else:
         train_sampler = DistributedSampler(train_dataset)
 
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=12)
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
     steps_per_epoch = int(np.ceil(len(train_dataloader) / args.gradient_accumulation_steps))  # use np.ceil() to include all batches
 
     if args.max_steps > 0:
@@ -329,6 +367,20 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
         except ValueError:
             logger.info("  Starting fine-tuning.")
 
+    total_epochs_for_status = int(args.num_train_epochs)
+    update_platform_status(
+        args.status_file,
+        {
+            "current_epoch": epochs_trained,
+            "total_epochs": total_epochs_for_status,
+            "current_step": global_step,
+            "total_steps": int(t_total),
+            "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
+        },
+        force=True,
+        state="RUNNING",
+    )
+
     model.zero_grad()
     
     train_iterator = trange(
@@ -392,6 +444,17 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+
+                update_platform_status(
+                    args.status_file,
+                    {
+                        "current_epoch": epoch_idx + 1,
+                        "total_epochs": total_epochs_for_status,
+                        "current_step": global_step,
+                        "total_steps": int(t_total),
+                        "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
+                    },
+                )
 
                 # Log train loss / learning rate only.
                 # 注意：这里不再使用 logging_steps 触发验证集评估。
@@ -474,6 +537,18 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 scheduler=scheduler,
             )
 
+        update_platform_status(
+            args.status_file,
+            {
+                "current_epoch": epoch_number,
+                "total_epochs": total_epochs_for_status,
+                "current_step": global_step,
+                "total_steps": int(t_total),
+                "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
+            },
+            force=True,
+        )
+
         if args.max_steps > 0 and global_step >= args.max_steps:
             train_iterator.close()
             break
@@ -493,7 +568,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
         
     avg_loss = tr_loss / max(total_loss_batches, 1)
     
-    return global_step, avg_loss
+    return global_step, avg_loss, best_epoch, best_score
 
 
 def evaluate(args, model, evalute_dataset, prefix=""):
@@ -504,7 +579,12 @@ def evaluate(args, model, evalute_dataset, prefix=""):
 
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(evalute_dataset)
-    eval_dataloader = DataLoader(evalute_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=12)
+    eval_dataloader = DataLoader(
+        evalute_dataset,
+        sampler=eval_sampler,
+        batch_size=args.eval_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -627,8 +707,11 @@ def load_and_cache_dataset(
         if os.path.isabs(data_file_name)
         else os.path.join(input_dir, data_file_name)
     )
+    cache_directory = args.dataset_cache_dir or os.path.dirname(data_file)
+    if not os.path.exists(cache_directory) and args.local_rank in [-1, 0]:
+        os.makedirs(cache_directory)
     cached_file = os.path.join(
-        os.path.dirname(data_file),
+        cache_directory,
         "cached_{}_for_{}_seqA{}_loss-{}.pkl".format(
             os.path.basename(data_file),
             args.model_type,
@@ -705,6 +788,20 @@ def main():
     parser.add_argument("--choose_device",type=str,choices=["cpu", "gpu"],default="gpu",help="选择运行设备：cpu 或 gpu，默认 gpu",)
     parser.add_argument("--overwrite_output_dir", action="store_true", default=True, help="Overwrite the content of the output directory")
     parser.add_argument("--overwrite_cache", action="store_true", help="Rebuild the cached training and evaluation sets")
+    parser.add_argument(
+        "--dataset_cache_dir",
+        default=None,
+        type=str,
+        help="可选的数据集缓存目录；未设置时保持原行为，写在数据文件旁。",
+    )
+    parser.add_argument(
+        "--dataloader_num_workers",
+        default=12,
+        type=int,
+        help="DataLoader worker 数；默认值保持原行为。",
+    )
+    parser.add_argument("--status_file", default=None, type=str, help="可选的平台状态文件")
+    parser.add_argument("--result_file", default=None, type=str, help="可选的平台训练结果文件")
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
 
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
@@ -839,11 +936,11 @@ def main():
         c = Counter()
 
         for doc_idx, doc in enumerate(iter_json_or_jsonl(data_file)):
-            if "labels" not in doc:
-                logger.warning("缺少labels字段，文件: %s，样本序号: %s", data_file, doc_idx)
+            if "label" not in doc:
+                logger.warning("缺少label字段，文件: %s，样本序号: %s", data_file, doc_idx)
                 continue
 
-            labels = doc["labels"]
+            labels = doc["label"]
             if args.loss_type in ["CE", "Focal"]:
                 lb = get_first_label(labels)
                 if lb is not None:
@@ -898,12 +995,31 @@ def main():
         if args.evaluate_file
         else None
     )
+    if evalute_dataset is not None and len(evalute_dataset) == 0:
+        raise ValueError("验证集在预处理后没有有效样本")
 
     # Training
     if args.do_train:
         train_dataset = load_and_cache_dataset(args, tokenizer, args.train_file, skip_empty_input=True)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer, evalute_dataset)
+        if len(train_dataset) == 0:
+            raise ValueError("训练集在预处理后没有有效样本")
+        global_step, tr_loss, best_epoch, best_score = train(args, train_dataset, model, tokenizer, evalute_dataset)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+        if args.result_file and args.local_rank in [-1, 0]:
+            result_dir = os.path.dirname(os.path.abspath(args.result_file))
+            if not os.path.exists(result_dir):
+                os.makedirs(result_dir)
+            result_payload = {
+                "global_step": global_step,
+                "average_loss": tr_loss,
+                "best_epoch": best_epoch,
+                "selection_score": best_score,
+            }
+            temp_result = "{}.tmp.{}".format(args.result_file, os.getpid())
+            with open(temp_result, "w", encoding="utf-8") as handle:
+                json.dump(result_payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temp_result, args.result_file)
 
     # 最优模型已在训练过程中直接写入固定目录，不再在训练结束后重复验证checkpoint。
 

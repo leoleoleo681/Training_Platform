@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "task_images": {
+    "text_classification_single": "training-text-single:1.0.0"
+  }
+}

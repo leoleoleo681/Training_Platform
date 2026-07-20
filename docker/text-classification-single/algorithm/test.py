@@ -8,7 +8,7 @@ import onnx
 import time
 
 from argparse import ArgumentParser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any
@@ -34,15 +34,19 @@ default_model_file_path = '/user_home/du.jing/国家安全/单标签/model/20260
 default_val_data_path = '/user_home/du.jing/国家安全/单标签/data/val_0616.jsonl'
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-def load_model( model_file_path, label_file_path):
+def load_model(model_file_path, label_file_path, choose_device="gpu"):
     global tokenizer
     global model
     global label2int
     global int2label
     
     # Get Env info
-    GPU_ID = 1 
-    device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+    if choose_device == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError("配置要求GPU，但当前没有可用CUDA设备")
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
     print(f"当前使用的设备: {device}")
     
     # Load model / label
@@ -251,15 +255,14 @@ def str_to_bool(value):
 # =========================
 
 # 真实标签字段
-TRUE_LABEL_FIELD = "labels"
+TRUE_LABEL_FIELD = "label"
 # 模型预测字段
 PRED_LABEL_FIELD = "model_pred"
 
 def get_label_value(value):
     """
     兼容：
-    labels = "类别A"
-    labels = ["类别A"]
+    label = "类别A"
 
     单标签任务统一转成字符串。
     """
@@ -320,7 +323,7 @@ def extract_true_and_pred(valid_data):
         pred_label = get_label_value(item.get(PRED_LABEL_FIELD))
 
         if true_label is None or true_label == "" or pred_label is None or pred_label == "":
-            print(f"[空标签] 验证集第 {idx} 条: labels={true_label}, model_pred={pred_label}")
+            print(f"[空标签] 验证集第 {idx} 条: label={true_label}, model_pred={pred_label}")
             skip_count += 1
             continue
 
@@ -462,6 +465,78 @@ def save_confusion_matrix(cm, classes, output_path, normalize=False, title='Conf
     print(f"混淆矩阵图已保存")
 
 
+def atomic_save_json(output_path, payload):
+    """Save a platform JSON artifact atomically."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.tmp.{os.getpid()}")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, output_path)
+
+
+def save_platform_artifacts(
+    report_path,
+    predictions_path,
+    model_id,
+    report_id,
+    dataset_id,
+    valid_data,
+    rows,
+    accuracy,
+    macro_p,
+    macro_r,
+    macro_f1,
+):
+    if not report_path or not predictions_path:
+        return
+
+    per_class = {}
+    for row in rows:
+        support = int(row["Support"])
+        correct = int(row["验证集预测正确数量"])
+        per_class[row["类别"]] = {
+            "precision": float(row["Precision"]),
+            "recall": float(row["Recall"]),
+            "f1": float(row["F1"]),
+            "count": support,
+            "accuracy": float(correct / support) if support else 0.0,
+        }
+
+    report = {
+        "model_id": model_id,
+        "report_id": report_id,
+        "dataset_id": dataset_id,
+        "sample_count": len(valid_data),
+        "accuracy": float(accuracy),
+        "precision": float(macro_p),
+        "recall": float(macro_r),
+        "f1": float(macro_f1),
+        "per_class": per_class,
+        "create_time": datetime.now(timezone.utc).isoformat(),
+    }
+
+    predictions = []
+    for index, item in enumerate(valid_data, start=1):
+        true_label = get_label_value(item.get(TRUE_LABEL_FIELD))
+        pred_label = get_label_value(item.get(PRED_LABEL_FIELD))
+        predictions.append({
+            "id": str(item.get("id", index)),
+            "text": item.get("content", ""),
+            "true_label": true_label,
+            "pred_label": pred_label,
+            "confidence": float(item.get("model_prob", 0.0)),
+            "correct": true_label == pred_label,
+            "file": dataset_id,
+        })
+
+    atomic_save_json(report_path, report)
+    atomic_save_json(predictions_path, predictions)
+
+
 def get_args():
     parser = ArgumentParser(description="Process valset evaluation")
     parser.add_argument("--model-path", type=str, default=default_model_file_path, help="Model to run evaluation")
@@ -476,6 +551,13 @@ def get_args():
     )
     parser.add_argument("--save-result-csv", type=str_to_bool, default=False, help="")
     parser.add_argument("--plot-confusion-matrix", type=str_to_bool, default=False, help="")
+    parser.add_argument("--choose-device", choices=["cpu", "gpu"], default="gpu")
+    parser.add_argument("--per-gpu-eval-batch-size", type=int, default=32)
+    parser.add_argument("--report-path", type=str, default=None)
+    parser.add_argument("--predictions-path", type=str, default=None)
+    parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--report-id", type=str, default=None)
+    parser.add_argument("--dataset-id", type=str, default=None)
     
     args = parser.parse_args()
     return args
@@ -492,7 +574,11 @@ def main():
     save_result_csv = opts.save_result_csv
     plot_confusion_matrix = opts.plot_confusion_matrix
     
-    load_model(model_file_path=model_path, label_file_path=label_path)
+    load_model(
+        model_file_path=model_path,
+        label_file_path=label_path,
+        choose_device=opts.choose_device,
+    )
     run_warmup()
     
     # 输出目录
@@ -701,6 +787,20 @@ def main():
     print(f"混淆矩阵 CSV     : {confusion_path}")
     if plot_confusion_matrix:
         print(f"混淆矩阵图片    : {confusion_image_path}")
+
+    save_platform_artifacts(
+        report_path=opts.report_path,
+        predictions_path=opts.predictions_path,
+        model_id=opts.model_id or Path(model_path).name,
+        report_id=opts.report_id or opts.result_suffix,
+        dataset_id=opts.dataset_id or Path(eval_data_path).name,
+        valid_data=valid_data,
+        rows=rows,
+        accuracy=accuracy,
+        macro_p=macro_p,
+        macro_r=macro_r,
+        macro_f1=macro_f1,
+    )
 
 
 if __name__ == "__main__":

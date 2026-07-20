@@ -163,10 +163,10 @@ class DataProcessorForBERT:
                 continue
 
             text_a = pre_process_text(str(row["content"]))
-            if "labels" in row:
-                label = row["labels"]
+            if "label" in row:
+                label = row["label"]
             else:
-                logger.warning("缺少labels字段，文件: %s，样本序号: %s", input_file, row_idx)
+                logger.warning("缺少label字段，文件: %s，样本序号: %s", input_file, row_idx)
                 skip_count += 1
                 continue
 

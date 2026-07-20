@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "test_id": "706e9a79-7865-4255-b93c-59a5be694fda",
+  "model_name": "demo_model",
+  "test_file": "demo_model_testing.jsonl",
+  "label_file": "demo_model_labels.json",
+  "choose_device": "gpu",
+  "per_gpu_eval_batch_size": 32,
+  "save_result_csv": false,
+  "plot_confusion_matrix": false
+}

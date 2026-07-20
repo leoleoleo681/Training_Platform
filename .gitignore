@@ -1,5 +1,7 @@
-.*
-!.gitignore
-!.github/
+.agents/
+.codex*
 /task*
-pretrained_model/
+**/pretrained_model/
+**/tests/.tmp/
+**/__pycache__/
+**/*.py[cod]
