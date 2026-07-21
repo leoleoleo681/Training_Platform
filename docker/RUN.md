@@ -156,7 +156,7 @@ evaluation/.../tests/{test_id}/  -> /mnt/task/evaluation/.../tests/{test_id}（�
 docker run \
   --name train-{task_id}-{model_name} \
   --init \
-  --gpus 'device=0' \
+  --gpus '"device=0,1"' \
   --shm-size=8g \
   --user 1000:1000 \
   --mount type=bind,src=/data/tasks/{user_id}/{task_id}/datasets,dst=/mnt/task/datasets,readonly \
@@ -186,7 +186,7 @@ docker run \
 多GPU训练只修改Docker参数，例如：
 
 ```bash
---gpus 'device=0,1'
+--gpus '"device=0,1"'
 ```
 
 ### 7.2 CPU训练

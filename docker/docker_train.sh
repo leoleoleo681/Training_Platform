@@ -4,7 +4,7 @@ set -Eeuo pipefail
 TASK_ROOT="${TASK_ROOT:-/mnt/sdb/user_home/lu.boyu/Training_Platform/docker_Training_Platform/Training_Platform/task_test}"
 TASK_ID="${TASK_ID:-task_test}"
 MODEL_NAME="${MODEL_NAME:-first_test_docker}"
-GPU_DEVICE="${GPU_DEVICE:-0}"
+GPU_DEVICES="${GPU_DEVICES:-0,1}"
 IMAGE="${IMAGE:-training-nlp:1.0.0}"
 
 if [[ ! "${TASK_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
@@ -15,8 +15,8 @@ if [[ ! "${MODEL_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     echo "Invalid MODEL_NAME: ${MODEL_NAME}" >&2
     exit 2
 fi
-if [[ ! "${GPU_DEVICE}" =~ ^[0-9]+$ ]]; then
-    echo "GPU_DEVICE must be a single numeric GPU id" >&2
+if [[ ! "${GPU_DEVICES}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "GPU_DEVICES must be a comma-separated list of numeric GPU ids" >&2
     exit 2
 fi
 
@@ -32,7 +32,7 @@ CONFIG_FILE="${MODEL_DIR}/run_train.json"
 docker run \
     --name "train-${TASK_ID}-${MODEL_NAME}" \
     --init \
-    --gpus "device=${GPU_DEVICE}" \
+    --gpus "\"device=${GPU_DEVICES}\"" \
     --shm-size=8g \
     --user 1000:1000 \
     --read-only \
