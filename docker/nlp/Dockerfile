@@ -12,10 +12,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/cache \
     TRAINING_TASK_ROOT=/mnt/task \
-    TRAINING_IMAGE_FAMILY=training-text-single \
+    TRAINING_IMAGE_FAMILY=training-nlp \
     TRAINING_PROTOCOL_VERSION=1 \
-    TRAINING_ALGORITHM_ROOT=/opt/training/algorithm \
-    TRAINING_PRETRAINED_MODEL=/opt/training/algorithm/pretrained_model/TinyBert \
+    TRAINING_ALGORITHMS_ROOT=/opt/training/algorithms \
+    TRAINING_PRETRAINED_MODEL=/opt/training/algorithms/text_classification_single/pretrained_model/TinyBert \
     TRAINING_IMAGE_VERSION=${IMAGE_VERSION}
 
 WORKDIR /opt/training
@@ -25,7 +25,8 @@ RUN python -m pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         -r /opt/training/requirements.txt
 
-COPY algorithm/ /opt/training/algorithm/
+COPY algorithms/ /opt/training/algorithms/
+COPY platform_runtime/ /opt/training/platform_runtime/
 COPY entrypoint.py /opt/training/entrypoint.py
 
 RUN test -f "${TRAINING_PRETRAINED_MODEL}/config.json" \
@@ -33,17 +34,17 @@ RUN test -f "${TRAINING_PRETRAINED_MODEL}/config.json" \
     && find "${TRAINING_PRETRAINED_MODEL}" -maxdepth 1 -type f \
          \( -name 'pytorch_model.bin' -o -name 'model.safetensors' \) | grep -q . \
     && python -c "import torch, transformers, sklearn, tensorboard, pandas, openpyxl, matplotlib, seaborn, onnx, onnxruntime; assert torch.__version__.split('+')[0] == '2.2.2'; assert torch.version.cuda == '11.8'; assert transformers.__version__ == '4.40.2'; assert sklearn.__version__ == '1.4.2'; assert tensorboard.__version__ == '2.16.2'; assert pandas.__version__ == '2.2.2'" \
-    && cd /opt/training/algorithm \
-    && python -c "import train, test, test_multi, convert_to_onnx"
+    && cd /opt/training/algorithms/text_classification_single \
+    && python -c "import platform_runtime, train, test, test_multi, convert_to_onnx"
 
 RUN if ! getent group 1000 >/dev/null; then groupadd --gid 1000 trainer; fi \
     && if ! getent passwd 1000 >/dev/null; then useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin trainer; fi \
     && mkdir -p /tmp/huggingface /tmp/matplotlib /tmp/cache \
     && chown -R 1000:1000 /tmp/huggingface /tmp/matplotlib /tmp/cache
 
-LABEL org.opencontainers.image.title="Training Text Single-label" \
+LABEL org.opencontainers.image.title="Training NLP" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
-      io.training-platform.image-family="training-text-single" \
+      io.training-platform.image-family="training-nlp" \
       io.training-platform.protocol-version="1" \
       io.training-platform.task-types="text_classification_single"
 

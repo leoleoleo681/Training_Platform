@@ -5,6 +5,7 @@ import re
 import torch
 import json
 import onnx
+import signal
 import time
 import traceback
 
@@ -27,6 +28,7 @@ from sklearn.metrics import (
 
 from transformers import BertTokenizer
 from classifier_model import BertForMultiLabel
+from platform_runtime import JobRuntime
 # from BERT_explainability.modules.BERT.BertForSequenceClassification import BertForMultiLabel
 
 
@@ -34,7 +36,7 @@ default_label_file_path = '/user_home/du.jing/国家安全/单标签/data/labels
 default_model_file_path = '/user_home/du.jing/国家安全/单标签/model/20260612_165846/best_checkpoint'
 default_val_data_path = '/user_home/du.jing/国家安全/单标签/data/val_0616.jsonl'
 SCRIPT_DIR = Path(__file__).resolve().parent
-_ACTIVE_STATUS_PATH = None
+_ACTIVE_RUNTIME = None
 
 def load_model(model_file_path, label_file_path, choose_device="gpu"):
     global tokenizer
@@ -480,6 +482,20 @@ def atomic_save_json(output_path, payload):
     os.replace(temp_path, output_path)
 
 
+def atomic_save_jsonl(output_path, rows):
+    """Save one JSON object per line using an atomic replacement."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.tmp.{os.getpid()}")
+    with temp_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+            f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, output_path)
+
+
 def save_platform_artifacts(
     report_path,
     predictions_path,
@@ -536,7 +552,7 @@ def save_platform_artifacts(
         })
 
     atomic_save_json(report_path, report)
-    atomic_save_json(predictions_path, predictions)
+    atomic_save_jsonl(predictions_path, predictions)
 
 
 def resolve_task_file(task_root, directory, filename, field):
@@ -552,43 +568,15 @@ def resolve_task_file(task_root, directory, filename, field):
     return str(path)
 
 
-def write_platform_status(path, state, error=None):
-    now = datetime.now(timezone.utc).isoformat()
-    payload = {}
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-    payload.update({
-        "schema_version": 1,
-        "operation": "validate",
-        "status": state,
-        "updated_at": now,
-        "error": error,
-    })
-    payload.setdefault("started_at", now)
-    payload.setdefault("finished_at", None)
-    payload.setdefault("progress", {
-        "current_step": 0,
-        "total_steps": 1,
-        "percent": 0.0,
-    })
-    if state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-        payload["finished_at"] = now
-    if state == "SUCCEEDED":
-        payload["progress"] = {
-            "current_step": 1,
-            "total_steps": 1,
-            "percent": 100.0,
-        }
-    atomic_save_json(path, payload)
+def handle_termination(signum, _frame):
+    if _ACTIVE_RUNTIME and _ACTIVE_RUNTIME.state not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        _ACTIVE_RUNTIME.cancel("Validation received signal {}".format(signum))
+    raise SystemExit(128 + signum)
 
 
 def apply_json_config(parser, args):
     """Let test.py own its JSON schema and platform path conventions."""
-    global _ACTIVE_STATUS_PATH
+    global _ACTIVE_RUNTIME
     if not args.config:
         return args
 
@@ -623,6 +611,35 @@ def apply_json_config(parser, args):
         raise ValueError("model_name不能为空")
     if not isinstance(test_id, str) or not test_id:
         raise ValueError("test_id不能为空")
+    if Path(model_name).name != model_name or Path(test_id).name != test_id:
+        raise ValueError("model_name和test_id必须是安全目录名")
+
+    test_root = config_path.parent
+    expected_test_root = (
+        task_root / "evaluation" / model_name / "tests" / test_id
+    ).resolve(strict=True)
+    if test_root != expected_test_root or config_path.name != "run_test.json":
+        raise ValueError(
+            "验证配置必须位于evaluation/{model_name}/tests/{test_id}/run_test.json"
+        )
+    task_id = config.get("task_id") or os.environ.get("TRAINING_TASK_ID")
+    runtime = JobRuntime(
+        job_root=test_root,
+        job_type="validate",
+        task_id=task_id,
+        model_name=model_name,
+        test_id=test_id,
+    )
+    runtime.start(created_at=config.get("created_at"))
+    runtime.emit_event(
+        "config_loaded",
+        message="Validation config loaded",
+        data={"config": config_path.name},
+    )
+    args.platform_runtime = runtime
+    _ACTIVE_RUNTIME = runtime
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
 
     model_root = (task_root / "models" / model_name).resolve(strict=True)
     model_path = model_root / "best_checkpoint"
@@ -631,20 +648,17 @@ def apply_json_config(parser, args):
     if not (model_path / "config.json").is_file():
         raise ValueError(f"模型不存在或不完整: {model_root}")
 
-    test_root = config_path.parent
+    outputs_root = test_root / "outputs"
     args.model_path = str(model_path)
     args.eval_data = resolve_task_file(task_root, "test", config.get("test_file"), "test_file")
     args.label_path = resolve_task_file(task_root, "labels", config.get("label_file"), "label_file")
-    args.output_dir = str(model_root)
+    args.output_dir = str(outputs_root)
     args.result_suffix = test_id
-    args.report_path = str(test_root / "report.json")
-    args.predictions_path = str(test_root / "predictions.json")
+    args.report_path = str(outputs_root / "report.json")
+    args.predictions_path = str(outputs_root / "predictions.jsonl")
     args.model_id = model_name
     args.report_id = test_id
     args.dataset_id = Path(args.eval_data).name
-    args.platform_status_path = test_root / "status.json"
-    _ACTIVE_STATUS_PATH = args.platform_status_path
-    write_platform_status(args.platform_status_path, "STARTING")
     return args
 
 
@@ -678,8 +692,10 @@ def get_args():
 
 def main():
     opts = get_args()
-    if opts.config:
-        write_platform_status(opts.platform_status_path, "RUNNING")
+    runtime = getattr(opts, "platform_runtime", None)
+    if runtime is not None:
+        runtime.change_phase("VALIDATING", "Standalone validation started")
+        runtime.update_progress(current=0, total=1, force=True)
     eval_data_path = str(Path(opts.eval_data).expanduser().resolve())
     model_path = str(Path(opts.model_path).expanduser().resolve())
     label_path = str(Path(opts.label_path).expanduser().resolve())
@@ -739,8 +755,7 @@ def main():
     y_true, y_pred = extract_true_and_pred(valid_data)
 
     if len(y_true) == 0:
-        print("[错误] 没有有效验证样本，无法计算指标。")
-        return
+        raise ValueError("没有有效验证样本，无法计算指标")
 
     # 只统计验证集真实标签中出现过的类别
     # 也就是“验证集里有的标签”
@@ -786,6 +801,23 @@ def main():
     print(f"weighted_p  : {weighted_p:.6f}")
     print(f"weighted_r  : {weighted_r:.6f}")
     print(f"weighted_f1 : {weighted_f1:.6f}")
+    if runtime is not None:
+        runtime.emit_metrics(
+            phase="validation",
+            step=1,
+            values={
+                "accuracy": accuracy,
+                "macro_precision": macro_p,
+                "macro_recall": macro_r,
+                "macro_f1": macro_f1,
+                "micro_precision": micro_p,
+                "micro_recall": micro_r,
+                "micro_f1": micro_f1,
+                "weighted_precision": weighted_p,
+                "weighted_recall": weighted_r,
+                "weighted_f1": weighted_f1,
+            },
+        )
 
     print("\n========== 计算每个类别指标 ==========")
 
@@ -902,6 +934,8 @@ def main():
     if plot_confusion_matrix:
         print(f"混淆矩阵图片    : {confusion_image_path}")
 
+    if runtime is not None:
+        runtime.change_phase("SAVING", "Saving validation artifacts")
     save_platform_artifacts(
         report_path=opts.report_path,
         predictions_path=opts.predictions_path,
@@ -916,20 +950,33 @@ def main():
         macro_f1=macro_f1,
     )
 
-    if opts.config:
-        write_platform_status(opts.platform_status_path, "SUCCEEDED")
+    if runtime is not None:
+        runtime.emit_event(
+            "artifacts_saved",
+            message="Validation artifacts saved",
+            data={
+                "report": str(Path(opts.report_path).relative_to(runtime.job_root)),
+                "predictions": str(Path(opts.predictions_path).relative_to(runtime.job_root)),
+            },
+        )
+        runtime.update_progress(current=1, total=1, force=True)
+        runtime.succeed()
 
 
 def platform_main():
     try:
         return main()
     except Exception as exc:
-        if _ACTIVE_STATUS_PATH:
-            write_platform_status(
-                _ACTIVE_STATUS_PATH,
-                "FAILED",
-                {"code": "EVALUATION_FAILED", "message": str(exc)},
+        if _ACTIVE_RUNTIME:
+            error_code = (
+                "CUDA_OUT_OF_MEMORY"
+                if isinstance(exc, torch.cuda.OutOfMemoryError)
+                else "EVALUATION_FAILED"
             )
+            try:
+                _ACTIVE_RUNTIME.fail(error_code, str(exc))
+            except Exception:
+                traceback.print_exc()
         traceback.print_exc()
         raise
 

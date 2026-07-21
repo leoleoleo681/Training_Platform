@@ -3,9 +3,8 @@ from collections import Counter
 import logging
 import os
 import random
+import signal
 import shutil
-from time import sleep
-import time
 import timeit
 import json
 import traceback
@@ -36,48 +35,15 @@ from data_processor import (
     DataProcessorForBERT,
 )
 from classifier_model import BertForMultiLabel
+from platform_runtime import JobRuntime
 
 logger = logging.getLogger(__name__)
-_ACTIVE_STATUS_FILE = None
+_ACTIVE_RUNTIME = None
 
 MODEL_CLASSES = {
     "bert": (BertConfig, BertForMultiLabel, BertTokenizer),
     # "roberta": (BertConfig, BertForMultiLabel, BertTokenizer)
 }
-
-
-def update_platform_status(status_file, progress, force=False, state=None):
-    """Atomically update optional platform progress without changing legacy logs."""
-    if not status_file:
-        return
-    now_monotonic = time.monotonic()
-    last_update = getattr(update_platform_status, "_last_update", 0.0)
-    if not force and now_monotonic - last_update < 1.0:
-        return
-    update_platform_status._last_update = now_monotonic
-    try:
-        payload = {}
-        if os.path.exists(status_file):
-            with open(status_file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        if state:
-            payload["status"] = state
-        payload["progress"] = progress
-        now = datetime.now(timezone.utc).isoformat()
-        payload["updated_at"] = now
-        if state in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-            payload["finished_at"] = now
-        if state == "SUCCEEDED":
-            payload["error"] = None
-        temp_file = "{}.tmp.{}".format(status_file, os.getpid())
-        with open(temp_file, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_file, status_file)
-    except Exception as exc:
-        logger.warning("更新平台状态失败: %s", exc)
 
 
 def atomic_save_json(path, payload):
@@ -105,9 +71,15 @@ def resolve_task_file(task_root, directory, filename, field):
     return str(path)
 
 
+def handle_termination(signum, _frame):
+    if _ACTIVE_RUNTIME and _ACTIVE_RUNTIME.state not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        _ACTIVE_RUNTIME.cancel("Training received signal {}".format(signum))
+    raise SystemExit(128 + signum)
+
+
 def apply_json_config(parser, args):
     """Let train.py own its JSON schema and platform path conventions."""
-    global _ACTIVE_STATUS_FILE
+    global _ACTIVE_RUNTIME
     if not args.config:
         return args
 
@@ -139,6 +111,30 @@ def apply_json_config(parser, args):
         raise ValueError("训练配置越出任务目录") from exc
 
     model_root = config_path.parent
+    model_name = config.get("model_name") or model_root.name
+    if not isinstance(model_name, str) or Path(model_name).name != model_name:
+        raise ValueError("model_name必须是安全目录名")
+    expected_model_root = (task_root / "models" / model_name).resolve(strict=True)
+    if model_root != expected_model_root or config_path.name != "run_train.json":
+        raise ValueError("训练配置必须位于models/{model_name}/run_train.json")
+    task_id = config.get("task_id") or os.environ.get("TRAINING_TASK_ID")
+    runtime = JobRuntime(
+        job_root=model_root,
+        job_type="train",
+        task_id=task_id,
+        model_name=model_name,
+    )
+    runtime.start(created_at=config.get("created_at"))
+    runtime.emit_event(
+        "config_loaded",
+        message="Training config loaded",
+        data={"config": config_path.name},
+    )
+    args.platform_runtime = runtime
+    _ACTIVE_RUNTIME = runtime
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
+
     algorithm_root = Path(os.environ.get("TRAINING_ALGORITHM_ROOT", Path(__file__).resolve().parent))
     args.model_name_or_path = os.environ.get(
         "TRAINING_PRETRAINED_MODEL",
@@ -153,44 +149,27 @@ def apply_json_config(parser, args):
         if evaluate_file
         else None
     )
-    args.dataset_cache_dir = str(task_root / "datasets" / "cache")
-    args.status_file = str(model_root / "status.json")
+    # 数据集可以只读挂载；预处理缓存统一写入当前任务的可写目录。
+    args.dataset_cache_dir = str(task_root / "dataset_cache")
     args.result_file = str(model_root / "runtime" / "train_result.json")
     args.platform_model_root = str(model_root)
     args.platform_config = config
     args.platform_started_at = datetime.now(timezone.utc).isoformat()
-    _ACTIVE_STATUS_FILE = args.status_file
-    atomic_save_json(
-        args.status_file,
-        {
-            "schema_version": 1,
-            "operation": "train",
-            "status": "STARTING",
-            "started_at": args.platform_started_at,
-            "updated_at": args.platform_started_at,
-            "finished_at": None,
-            "progress": {
-                "current_epoch": 0,
-                "total_epochs": None,
-                "current_step": 0,
-                "total_steps": None,
-                "percent": 0.0,
-            },
-            "error": None,
-        },
-    )
     return args
 
 
 def finalize_platform_training(args):
     if not getattr(args, "config", None) or args.local_rank not in [-1, 0]:
         return
+    runtime = args.platform_runtime
+    runtime.change_phase("FINALIZING", "Finalizing training artifacts")
     model_root = Path(args.platform_model_root)
     model_source = Path(args.model_output_dir)
     if not (model_source / "config.json").is_file():
         raise RuntimeError("训练完成但模型目录不完整: {}".format(model_source))
     best_checkpoint = model_root / "best_checkpoint"
     shutil.copytree(str(model_source), str(best_checkpoint))
+    runtime.checkpoint_saved(best_checkpoint)
 
     result = {}
     result_path = Path(args.result_file)
@@ -217,16 +196,7 @@ def finalize_platform_training(args):
             "checkpoint_dir": "checkpoints",
         },
     )
-    update_platform_status(
-        args.status_file,
-        {
-            "current_epoch": int(args.num_train_epochs),
-            "total_epochs": int(args.num_train_epochs),
-            "percent": 100.0,
-        },
-        force=True,
-        state="SUCCEEDED",
-    )
+    runtime.succeed()
 
 
 def set_seed(args):
@@ -307,6 +277,9 @@ def save_training_checkpoint(
         torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
     if optimizer is not None or scheduler is not None:
         logger.info("Saving optimizer and scheduler states to %s", output_dir)
+    runtime = getattr(args, "platform_runtime", None)
+    if runtime is not None:
+        runtime.checkpoint_saved(Path(output_dir))
 
 class DynamicNonSecuritySampler(torch.utils.data.Sampler):
     """
@@ -526,18 +499,16 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
             logger.info("  Starting fine-tuning.")
 
     total_epochs_for_status = int(args.num_train_epochs)
-    update_platform_status(
-        args.status_file,
-        {
-            "current_epoch": epochs_trained,
-            "total_epochs": total_epochs_for_status,
-            "current_step": global_step,
-            "total_steps": int(t_total),
-            "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
-        },
-        force=True,
-        state="RUNNING",
-    )
+    runtime = getattr(args, "platform_runtime", None)
+    if runtime is not None and args.local_rank in [-1, 0]:
+        runtime.change_phase("TRAINING", "Training loop started")
+        runtime.update_progress(
+            current=global_step,
+            total=int(t_total),
+            epoch=epochs_trained,
+            total_epochs=total_epochs_for_status,
+            force=True,
+        )
 
     model.zero_grad()
     
@@ -603,24 +574,35 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 model.zero_grad()
                 global_step += 1
 
-                update_platform_status(
-                    args.status_file,
-                    {
-                        "current_epoch": epoch_idx + 1,
-                        "total_epochs": total_epochs_for_status,
-                        "current_step": global_step,
-                        "total_steps": int(t_total),
-                        "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
-                    },
-                )
+                if runtime is not None and args.local_rank in [-1, 0]:
+                    runtime.update_progress(
+                        current=global_step,
+                        total=int(t_total),
+                        epoch=epoch_idx + 1,
+                        total_epochs=total_epochs_for_status,
+                    )
 
                 # Log train loss / learning rate only.
                 # 注意：这里不再使用 logging_steps 触发验证集评估。
                 # logging_steps 现在只负责写入 TensorBoard 的训练 loss 和 lr。
                 # 验证集评估改为跟随 save_steps：每保存一次 checkpoint，就验证一次。
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    tb_writer.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
-                    tb_writer.add_scalar("loss", (tr_loss - logging_loss) / (global_step - logging_step_start), global_step)
+                    learning_rate = scheduler.get_last_lr()[0]
+                    interval_loss = (tr_loss - logging_loss) / max(
+                        global_step - logging_step_start, 1
+                    )
+                    tb_writer.add_scalar("lr", learning_rate, global_step)
+                    tb_writer.add_scalar("loss", interval_loss, global_step)
+                    if runtime is not None:
+                        runtime.emit_metrics(
+                            phase="train",
+                            step=global_step,
+                            epoch=epoch_idx + 1,
+                            values={
+                                "loss": interval_loss,
+                                "learning_rate": learning_rate,
+                            },
+                        )
 
                     logging_loss = tr_loss
                     logging_step_start = global_step
@@ -647,11 +629,28 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
         if args.local_rank in [-1, 0] and epoch_loss_batches > 0:
             epoch_avg_loss = epoch_loss_sum / epoch_loss_batches
             tb_writer.add_scalar("epoch/train_loss", epoch_avg_loss, epoch_number)
+            if runtime is not None:
+                runtime.emit_metrics(
+                    phase="train",
+                    step=global_step,
+                    epoch=epoch_number,
+                    values={"epoch_loss": epoch_avg_loss},
+                )
 
             if evalute_dataset is not None:
+                if runtime is not None:
+                    runtime.change_phase("VALIDATING", "Running epoch validation")
                 metrics = evaluate(args, model, evalute_dataset, prefix="epoch-{}".format(epoch_number))
                 for key, value in metrics.items():
                     tb_writer.add_scalar("eval/{}".format(key), value, epoch_number)
+                if runtime is not None:
+                    runtime.emit_metrics(
+                        phase="validation",
+                        step=global_step,
+                        epoch=epoch_number,
+                        values=metrics,
+                    )
+                    runtime.change_phase("TRAINING", "Epoch validation completed")
                 current_score = metrics["macro_f1"]
                 is_better = best_score is None or current_score > best_score
                 logger.info(
@@ -671,12 +670,16 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
             if is_better:
                 best_score = current_score
                 best_epoch = epoch_number
+                if runtime is not None:
+                    runtime.change_phase("SAVING", "Saving selected model")
                 save_training_checkpoint(
                     args=args,
                     model=model,
                     tokenizer=tokenizer,
                     output_dir=args.model_output_dir,
                 )
+                if runtime is not None:
+                    runtime.change_phase("TRAINING", "Selected model saved")
                 logger.info(
                     "Updated selected model at epoch %s: %s",
                     best_epoch,
@@ -686,6 +689,8 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
         # checkpoint是可选的训练状态快照，与稳定模型选优互不影响。
         if args.local_rank in [-1, 0] and args.save_each_epoch:
             output_dir = os.path.join(args.checkpoint_dir, "checkpoint-epoch-{}".format(epoch_number))
+            if runtime is not None:
+                runtime.change_phase("SAVING", "Saving epoch checkpoint")
             save_training_checkpoint(
                 args=args,
                 model=model,
@@ -694,18 +699,17 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 optimizer=optimizer,
                 scheduler=scheduler,
             )
+            if runtime is not None:
+                runtime.change_phase("TRAINING", "Epoch checkpoint saved")
 
-        update_platform_status(
-            args.status_file,
-            {
-                "current_epoch": epoch_number,
-                "total_epochs": total_epochs_for_status,
-                "current_step": global_step,
-                "total_steps": int(t_total),
-                "percent": round(min(100.0, 100.0 * global_step / max(float(t_total), 1.0)), 2),
-            },
-            force=True,
-        )
+        if runtime is not None and args.local_rank in [-1, 0]:
+            runtime.update_progress(
+                current=global_step,
+                total=int(t_total),
+                epoch=epoch_number,
+                total_epochs=total_epochs_for_status,
+                force=True,
+            )
 
         if args.max_steps > 0 and global_step >= args.max_steps:
             train_iterator.close()
@@ -713,12 +717,16 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
 
     if args.local_rank in [-1, 0]:
         if best_score is None:
+            if runtime is not None:
+                runtime.change_phase("SAVING", "Saving fallback model")
             save_training_checkpoint(
                 args=args,
                 model=model,
                 tokenizer=tokenizer,
                 output_dir=args.model_output_dir,
             )
+            if runtime is not None:
+                runtime.change_phase("TRAINING", "Fallback model saved")
             logger.warning("No epoch selection score was produced; saved the current model as fallback.")
         else:
             logger.info("Selected epoch=%s, score=%s", best_epoch, best_score)
@@ -960,7 +968,6 @@ def run():
         type=int,
         help="DataLoader worker 数；默认值保持原行为。",
     )
-    parser.add_argument("--status_file", default=None, type=str, help="可选的平台状态文件")
     parser.add_argument("--result_file", default=None, type=str, help="可选的平台训练结果文件")
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
 
@@ -1198,13 +1205,16 @@ def main():
     try:
         return run()
     except Exception as exc:
-        if _ACTIVE_STATUS_FILE:
-            update_platform_status(
-                _ACTIVE_STATUS_FILE,
-                {"percent": 0.0},
-                force=True,
-                state="FAILED",
+        if _ACTIVE_RUNTIME:
+            error_code = (
+                "CUDA_OUT_OF_MEMORY"
+                if isinstance(exc, torch.cuda.OutOfMemoryError)
+                else "TRAINING_FAILED"
             )
+            try:
+                _ACTIVE_RUNTIME.fail(error_code, str(exc))
+            except Exception:
+                logger.exception("写入训练失败状态时发生异常")
         traceback.print_exc()
         raise
 

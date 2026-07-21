@@ -1,27 +1,33 @@
-# 构建单标签文本分类镜像
+# 构建 NLP 任务镜像
 
-本文只说明`training-text-single`镜像的准备、构建和检查。训练数据挂载及容器启动见[运行说明](../RUN.md)。
+本文说明`training-nlp`镜像的准备、构建和检查。当前已接入单标签文本分类，后续多标签分类和 UIE 复用同一镜像。训练数据挂载及容器启动见[运行说明](../RUN.md)。
 
 ## 1. 构建目录
 
-`docker/text-classification-single/`是完整且独立的Docker构建上下文：
+`docker/nlp/`是完整且独立的Docker构建上下文：
 
 ```text
-text-classification-single/
+nlp/
 ├── Dockerfile
 ├── .dockerignore
 ├── requirements.txt
 ├── entrypoint.py
-└── algorithm/
-    ├── train.py
-    ├── test.py
-    ├── classifier_model.py
-    ├── data_processor.py
-    ├── loss_function.py
-    └── pretrained_model/TinyBert/        # 构建前由使用者放入
+├── platform_runtime/
+│   ├── __init__.py
+│   └── runtime.py
+└── algorithms/
+    ├── text_classification_single/
+    │   ├── train.py
+    │   ├── test.py
+    │   ├── classifier_model.py
+    │   ├── data_processor.py
+    │   ├── loss_function.py
+    │   └── pretrained_model/TinyBert/    # 构建前由使用者放入
+    ├── text_classification_multi/        # 后续接入
+    └── uie/                              # 后续接入
 ```
 
-Dockerfile只复制`requirements.txt`、`entrypoint.py`和`algorithm/`。Dockerfile、`.dockerignore`及本说明不会进入镜像。
+Dockerfile只复制`requirements.txt`、`entrypoint.py`、`platform_runtime/`和`algorithms/`。Dockerfile、`.dockerignore`及本说明不会进入镜像。
 
 ## 2. 构建前准备
 
@@ -40,7 +46,7 @@ FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-devel
 将完整预训练模型放到：
 
 ```text
-docker/text-classification-single/algorithm/pretrained_model/TinyBert/
+docker/nlp/algorithms/text_classification_single/pretrained_model/TinyBert/
 ```
 
 至少包含：
@@ -76,8 +82,8 @@ Dockerfile通过构建参数指定PyPI源，不执行永久性的`pip config set
 docker build \
   --build-arg IMAGE_VERSION=1.0.0 \
   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-  -t training-text-single:1.0.0 \
-  docker/text-classification-single
+  -t training-nlp:1.0.0 \
+  docker/nlp
 ```
 
 | 构建参数 | 默认值 | 说明 |
@@ -93,7 +99,7 @@ docker build \
 
 1. 继承PyTorch 2.2.2、CUDA 11.8、cuDNN 8开发镜像；
 2. 安装固定版本Python依赖；
-3. 将算法复制到`/opt/training/algorithm/`；
+3. 将各任务算法复制到`/opt/training/algorithms/`；
 4. 将通用入口复制到`/opt/training/entrypoint.py`；
 5. 检查TinyBert的配置、词表和至少一种权重文件；
 6. 导入全部运行依赖，并断言关键依赖版本；
@@ -103,20 +109,20 @@ docker build \
 
 其中`torch.version.cuda == "11.8"`只验证PyTorch编译使用的CUDA版本，不代表构建机器或运行机器已经有可见GPU。
 
-通用入口不读取JSON配置，也不维护训练参数列表。它只把`train`或`validate`转换为对应算法脚本调用，并传递`--config`。训练与评估脚本自行读取配置，因此增加算法参数时无需同步修改入口。
+通用入口不读取JSON配置，也不维护训练参数列表。它先根据`--task-type`选择算法目录，再把`train`或`validate`转换为对应脚本调用并传递`--config`。训练与评估脚本自行读取配置，因此增加算法参数时无需同步修改入口。
 
 ## 5. 构建后检查
 
 确认镜像存在并查看标签：
 
 ```bash
-docker image inspect training-text-single:1.0.0
+docker image inspect training-nlp:1.0.0
 ```
 
 确认容器入口可启动：
 
 ```bash
-docker run --rm training-text-single:1.0.0 --help
+docker run --rm training-nlp:1.0.0 --help
 ```
 
 在GPU运行机器上检查PyTorch能否看到容器分配的GPU：
@@ -125,7 +131,7 @@ docker run --rm training-text-single:1.0.0 --help
 docker run --rm \
   --gpus 'device=0' \
   --entrypoint python \
-  training-text-single:1.0.0 \
+  training-nlp:1.0.0 \
   -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
 ```
 
