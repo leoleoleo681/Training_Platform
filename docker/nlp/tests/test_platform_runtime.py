@@ -1,16 +1,47 @@
+import argparse
 import json
+import pickle
 import shutil
 import sys
+import threading
 import unittest
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from platform_runtime import JobRuntime
+from platform_runtime import JobRuntime, training_argument_snapshot
+
+
+class FakeCudaTensor:
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return [1.0, 2.0]
 
 
 class JobRuntimeTest(unittest.TestCase):
+    def test_training_argument_snapshot_excludes_platform_runtime_fields(self):
+        args = argparse.Namespace(
+            learning_rate=0.001,
+            num_train_epochs=3,
+            platform_runtime=threading.RLock(),
+            platform_config={"task_id": "task-1"},
+            device="cuda:0",
+            label_distribution=FakeCudaTensor(),
+        )
+
+        snapshot = training_argument_snapshot(args)
+
+        self.assertEqual(snapshot.learning_rate, 0.001)
+        self.assertEqual(snapshot.num_train_epochs, 3)
+        self.assertFalse(hasattr(snapshot, "platform_runtime"))
+        self.assertFalse(hasattr(snapshot, "platform_config"))
+        self.assertEqual(snapshot.device, "cuda:0")
+        self.assertEqual(snapshot.label_distribution, [1.0, 2.0])
+        pickle.dumps(snapshot)
+
     def test_writes_failed_status_and_error_event(self):
         temp_dir = (
             Path(__file__).resolve().parents[3]

@@ -7,7 +7,6 @@ import signal
 import shutil
 import timeit
 import json
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,7 +34,7 @@ from data_processor import (
     DataProcessorForBERT,
 )
 from classifier_model import BertForMultiLabel
-from platform_runtime import JobRuntime
+from platform_runtime import JobRuntime, training_argument_snapshot
 
 logger = logging.getLogger(__name__)
 _ACTIVE_RUNTIME = None
@@ -130,7 +129,6 @@ def apply_json_config(parser, args):
         message="Training config loaded",
         data={"config": config_path.name},
     )
-    args.platform_runtime = runtime
     _ACTIVE_RUNTIME = runtime
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
@@ -158,10 +156,11 @@ def apply_json_config(parser, args):
     return args
 
 
-def finalize_platform_training(args):
+def finalize_platform_training(args, runtime=None):
     if not getattr(args, "config", None) or args.local_rank not in [-1, 0]:
         return
-    runtime = args.platform_runtime
+    if runtime is None:
+        raise RuntimeError("平台训练缺少JobRuntime")
     runtime.change_phase("FINALIZING", "Finalizing training artifacts")
     model_root = Path(args.platform_model_root)
     model_source = Path(args.model_output_dir)
@@ -260,6 +259,7 @@ def save_training_checkpoint(
     output_dir,
     optimizer=None,
     scheduler=None,
+    runtime=None,
 ):
     """Save model/tokenizer/training args, and optionally optimizer/scheduler states."""
     if not os.path.exists(output_dir):
@@ -268,7 +268,10 @@ def save_training_checkpoint(
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    torch.save(args, os.path.join(output_dir, "training_args.bin"))
+    torch.save(
+        training_argument_snapshot(args),
+        os.path.join(output_dir, "training_args.bin"),
+    )
     logger.info("Saving model checkpoint to %s", output_dir)
 
     if optimizer is not None:
@@ -277,7 +280,6 @@ def save_training_checkpoint(
         torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
     if optimizer is not None or scheduler is not None:
         logger.info("Saving optimizer and scheduler states to %s", output_dir)
-    runtime = getattr(args, "platform_runtime", None)
     if runtime is not None:
         runtime.checkpoint_saved(Path(output_dir))
 
@@ -370,7 +372,7 @@ class DynamicNonSecuritySampler(torch.utils.data.Sampler):
     def __len__(self):
         return self.epoch_size
 
-def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
+def train(args, train_dataset, model, tokenizer, evalute_dataset=None, runtime=None):
     """ Train the model """
     tb_writer = None
     if args.local_rank in [-1, 0]:
@@ -499,7 +501,6 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
             logger.info("  Starting fine-tuning.")
 
     total_epochs_for_status = int(args.num_train_epochs)
-    runtime = getattr(args, "platform_runtime", None)
     if runtime is not None and args.local_rank in [-1, 0]:
         runtime.change_phase("TRAINING", "Training loop started")
         runtime.update_progress(
@@ -617,6 +618,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                         output_dir=output_dir,
                         optimizer=optimizer,
                         scheduler=scheduler,
+                        runtime=runtime,
                     )
 
             if args.max_steps > 0 and global_step >= args.max_steps:
@@ -677,6 +679,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                     model=model,
                     tokenizer=tokenizer,
                     output_dir=args.model_output_dir,
+                    runtime=runtime,
                 )
                 if runtime is not None:
                     runtime.change_phase("TRAINING", "Selected model saved")
@@ -698,6 +701,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 output_dir=output_dir,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                runtime=runtime,
             )
             if runtime is not None:
                 runtime.change_phase("TRAINING", "Epoch checkpoint saved")
@@ -724,6 +728,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None):
                 model=model,
                 tokenizer=tokenizer,
                 output_dir=args.model_output_dir,
+                runtime=runtime,
             )
             if runtime is not None:
                 runtime.change_phase("TRAINING", "Fallback model saved")
@@ -1174,7 +1179,14 @@ def run():
         train_dataset = load_and_cache_dataset(args, tokenizer, args.train_file, skip_empty_input=True)
         if len(train_dataset) == 0:
             raise ValueError("训练集在预处理后没有有效样本")
-        global_step, tr_loss, best_epoch, best_score = train(args, train_dataset, model, tokenizer, evalute_dataset)
+        global_step, tr_loss, best_epoch, best_score = train(
+            args,
+            train_dataset,
+            model,
+            tokenizer,
+            evalute_dataset,
+            runtime=_ACTIVE_RUNTIME,
+        )
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
         if args.result_file and args.local_rank in [-1, 0]:
             result_dir = os.path.dirname(os.path.abspath(args.result_file))
@@ -1196,7 +1208,7 @@ def run():
 
     logger.info("script finishes")
 
-    finalize_platform_training(args)
+    finalize_platform_training(args, runtime=_ACTIVE_RUNTIME)
 
     return 0
 
@@ -1215,7 +1227,6 @@ def main():
                 _ACTIVE_RUNTIME.fail(error_code, str(exc))
             except Exception:
                 logger.exception("写入训练失败状态时发生异常")
-        traceback.print_exc()
         raise
 
 

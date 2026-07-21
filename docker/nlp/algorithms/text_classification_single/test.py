@@ -636,7 +636,6 @@ def apply_json_config(parser, args):
         message="Validation config loaded",
         data={"config": config_path.name},
     )
-    args.platform_runtime = runtime
     _ACTIVE_RUNTIME = runtime
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
@@ -692,7 +691,7 @@ def get_args():
 
 def main():
     opts = get_args()
-    runtime = getattr(opts, "platform_runtime", None)
+    runtime = _ACTIVE_RUNTIME
     if runtime is not None:
         runtime.change_phase("VALIDATING", "Standalone validation started")
         runtime.update_progress(current=0, total=1, force=True)
@@ -977,7 +976,6 @@ def platform_main():
                 _ACTIVE_RUNTIME.fail(error_code, str(exc))
             except Exception:
                 traceback.print_exc()
-        traceback.print_exc()
         raise
 
 
