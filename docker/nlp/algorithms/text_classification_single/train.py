@@ -4,7 +4,6 @@ import logging
 import os
 import random
 import signal
-import shutil
 import timeit
 import json
 from datetime import datetime, timezone
@@ -138,7 +137,7 @@ def apply_json_config(parser, args):
         "TRAINING_PRETRAINED_MODEL",
         str(algorithm_root / "pretrained_model" / "TinyBert"),
     )
-    args.output_dir = str(model_root / "output_models")
+    args.output_dir = str(model_root / "best_checkpoint")
     args.label_file = resolve_task_file(task_root, "labels", config.get("label_file"), "label_file")
     args.train_file = resolve_task_file(task_root, "training", config.get("train_file"), "train_file")
     evaluate_file = config.get("evaluate_file")
@@ -163,12 +162,9 @@ def finalize_platform_training(args, runtime=None):
         raise RuntimeError("平台训练缺少JobRuntime")
     runtime.change_phase("FINALIZING", "Finalizing training artifacts")
     model_root = Path(args.platform_model_root)
-    model_source = Path(args.model_output_dir)
-    if not (model_source / "config.json").is_file():
-        raise RuntimeError("训练完成但模型目录不完整: {}".format(model_source))
-    best_checkpoint = model_root / "best_checkpoint"
-    shutil.copytree(str(model_source), str(best_checkpoint))
-    runtime.checkpoint_saved(best_checkpoint)
+    best_checkpoint = Path(args.model_output_dir)
+    if not (best_checkpoint / "config.json").is_file():
+        raise RuntimeError("训练完成但模型目录不完整: {}".format(best_checkpoint))
 
     result = {}
     result_path = Path(args.result_file)
@@ -191,8 +187,8 @@ def finalize_platform_training(args, runtime=None):
             "best_epoch": result.get("best_epoch"),
             "selection_score": result.get("selection_score"),
             "best_checkpoint": "best_checkpoint",
-            "legacy_model_dir": "output_models/model",
             "checkpoint_dir": "checkpoints",
+            "tensorboard_dir": "tensorboard",
         },
     )
     runtime.succeed()
@@ -376,7 +372,7 @@ def train(args, train_dataset, model, tokenizer, evalute_dataset=None, runtime=N
     """ Train the model """
     tb_writer = None
     if args.local_rank in [-1, 0]:
-        tb_dir = os.path.join(args.output_dir, "tensorboard")
+        tb_dir = args.tensorboard_dir
         if not os.path.exists(tb_dir):
             os.makedirs(tb_dir)
         tb_writer = SummaryWriter(tb_dir)
@@ -1007,10 +1003,17 @@ def run():
         if not getattr(args, field):
             parser.error("--{}不能为空".format(field))
 
-    # 稳定模型固定写入output_dir/model；checkpoint单独写入相邻的checkpoints目录。
+    # 平台任务只保留best_checkpoint最终模型；断点和TensorBoard日志使用独立目录。
     args.output_dir = os.path.abspath(args.output_dir)
-    args.model_output_dir = os.path.join(args.output_dir, "model")
-    args.checkpoint_dir = os.path.join(os.path.dirname(args.output_dir), "checkpoints")
+    if args.config:
+        model_root = os.path.abspath(args.platform_model_root)
+        args.model_output_dir = args.output_dir
+        args.checkpoint_dir = os.path.join(model_root, "checkpoints")
+        args.tensorboard_dir = os.path.join(model_root, "tensorboard")
+    else:
+        args.model_output_dir = os.path.join(args.output_dir, "model")
+        args.checkpoint_dir = os.path.join(os.path.dirname(args.output_dir), "checkpoints")
+        args.tensorboard_dir = os.path.join(args.output_dir, "tensorboard")
 
     if args.focal_gamma < 0:
         raise ValueError("focal_gamma不能小于0")

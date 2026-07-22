@@ -328,8 +328,8 @@ def get_model_name(model_path: str) -> str:
     if path.exists():
         if path.is_file():
             return path.parent.name or path.stem
-        if path.name == "model" and path.parent.name == "output_models":
-            return path.parent.parent.name
+        if path.name == "best_checkpoint":
+            return path.parent.name
         return path.name
 
     parts = [part for part in normalized_path.replace("\\", "/").split("/") if part]
@@ -338,8 +338,8 @@ def get_model_name(model_path: str) -> str:
 
     name = parts[-1]
     parent_name = parts[-2] if len(parts) > 1 else ""
-    if name == "model" and parent_name == "output_models" and len(parts) > 2:
-        return parts[-3]
+    if name == "best_checkpoint" and len(parts) > 1:
+        return parent_name
     model_file_suffixes = {".pt", ".pth", ".bin", ".safetensors", ".ckpt", ".onnx", ".pb", ".h5"}
     if Path(name).suffix.lower() in model_file_suffixes:
         return parent_name or Path(name).stem

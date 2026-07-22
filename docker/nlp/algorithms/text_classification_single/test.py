@@ -643,8 +643,6 @@ def apply_json_config(parser, args):
     model_root = (task_root / "models" / model_name).resolve(strict=True)
     model_path = model_root / "best_checkpoint"
     if not (model_path / "config.json").is_file():
-        model_path = model_root / "output_models" / "model"
-    if not (model_path / "config.json").is_file():
         raise ValueError(f"模型不存在或不完整: {model_root}")
 
     outputs_root = test_root / "outputs"
